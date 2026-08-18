@@ -34,6 +34,10 @@ def exact_keys(obj: dict, expected: set[str]) -> bool:
     return set(obj.keys()) == expected
 
 
+# =========================================================
+# HTML SAFETY
+# =========================================================
+
 def unsafe_html(html: str) -> bool:
     """
     Block:
@@ -44,42 +48,44 @@ def unsafe_html(html: str) -> bool:
       - javascript: URLs
 
     IMPORTANT:
-      data: URIs are intentionally allowed.
+      data: URIs are allowed.
     """
 
     unsafe_patterns = [
-        # Script tags
+        # <script>
         r"<\s*script\b",
 
-        # Closing script tags
+        # </script>
         r"</\s*script\s*>",
 
-        # Iframe tags
+        # <iframe>
         r"<\s*iframe\b",
 
-        # Inline event handlers:
-        # onclick=
-        # onload=
-        # onerror=
-        # onmouseover=
-        # onanimationstart=
-        # etc.
+        # onclick=, onload=, onerror=, onmouseover=, etc.
         r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
 
-        # javascript: URLs
+        # javascript:
         r"javascript\s*:",
     ]
 
     for pattern in unsafe_patterns:
-        if re.search(pattern, html, flags=re.IGNORECASE):
+        if re.search(
+            pattern,
+            html,
+            flags=re.IGNORECASE
+        ):
             return True
 
     return False
 
 
+# =========================================================
+# EMAIL DOMAIN VALIDATION
+# =========================================================
+
 def valid_email_for_domain(email: str) -> bool:
     """
-    Recipient must have exactly the assigned domain.
+    Recipient must have exactly the assigned email domain.
 
     Allowed:
         person@notify-dm117fp.example
@@ -91,6 +97,8 @@ def valid_email_for_domain(email: str) -> bool:
         person@@notify-dm117fp.example
         @notify-dm117fp.example
 
+    data: is irrelevant here because this is an email
+    recipient field, not HTML.
     """
 
     pattern = (
@@ -99,8 +107,15 @@ def valid_email_for_domain(email: str) -> bool:
         + r"$"
     )
 
-    return re.fullmatch(pattern, email) is not None
+    return re.fullmatch(
+        pattern,
+        email
+    ) is not None
 
+
+# =========================================================
+# HEALTH / ROOT
+# =========================================================
 
 @app.get("/")
 def root():
@@ -110,22 +125,24 @@ def root():
 
 
 # =========================================================
-# ACTION FIREWALL ENDPOINT
+# ACTION FIREWALL
 # =========================================================
 
 @app.post("/action-firewall")
 async def action_firewall(request: Request):
 
-    # -----------------------------------------------------
+    # =====================================================
     # 1. TOP-LEVEL SCHEMA
-    # -----------------------------------------------------
+    # =====================================================
 
-    # Read raw request body ourselves.
-    # This prevents FastAPI/Pydantic from returning
-    # its own 422 response for malformed JSON.
+    # Parse the raw JSON ourselves.
+    # This ensures malformed requests return our required
+    # JSON response instead of FastAPI's default 422.
+
     try:
         raw_body = await request.body()
         payload = json.loads(raw_body)
+
     except Exception:
         return firewall_result(
             "block",
@@ -133,7 +150,7 @@ async def action_firewall(request: Request):
         )
 
     # Top-level must be a JSON object.
-    if not isinstance(payload, dict):
+    if type(payload) is not dict:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
@@ -152,14 +169,16 @@ async def action_firewall(request: Request):
         "action",
     }
 
-    # Missing required fields
-    if not required_keys.issubset(payload.keys()):
+    # Missing required keys.
+    if not required_keys.issubset(
+        payload.keys()
+    ):
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
         )
 
-    # Extra top-level fields
+    # Extra top-level keys.
     if not set(payload.keys()).issubset(
         allowed_top_level_keys
     ):
@@ -168,10 +187,13 @@ async def action_firewall(request: Request):
             "INVALID_SCHEMA"
         )
 
+    # -----------------------------------------------------
     # provenance
+    # -----------------------------------------------------
+
     provenance = payload["provenance"]
 
-    if not isinstance(provenance, str):
+    if type(provenance) is not str:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
@@ -186,31 +208,50 @@ async def action_firewall(request: Request):
             "INVALID_SCHEMA"
         )
 
+    # -----------------------------------------------------
     # humanApproved
+    # -----------------------------------------------------
+
     human_approved = payload["humanApproved"]
 
-    if not isinstance(human_approved, bool):
+    if type(human_approved) is not bool:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
         )
 
-    # Optional untrustedContent
+    # -----------------------------------------------------
+    # untrustedContent
+    # -----------------------------------------------------
+
     if "untrustedContent" in payload:
 
-        if not isinstance(
-            payload["untrustedContent"],
-            str
-        ):
+        if type(
+            payload["untrustedContent"]
+        ) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
+    # IMPORTANT:
+    #
+    # We DO NOT inspect untrustedContent for suspicious
+    # phrases.
+    #
+    # Prompt injection inside untrustedContent does not
+    # change the verdict by itself.
+    #
+    # Only the actual action is evaluated.
+
+
+    # -----------------------------------------------------
     # action
+    # -----------------------------------------------------
+
     action = payload["action"]
 
-    if not isinstance(action, dict):
+    if type(action) is not dict:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
@@ -238,33 +279,34 @@ async def action_firewall(request: Request):
     tool = action["tool"]
     args = action["args"]
 
-    if not isinstance(tool, str):
+    if type(tool) is not str:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
         )
 
-    if not isinstance(args, dict):
+    if type(args) is not dict:
         return firewall_result(
             "block",
             "INVALID_SCHEMA"
         )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 2. TOOL ALLOWLIST
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool not in ALLOWED_TOOLS:
+
         return firewall_result(
             "block",
             "TOOL_NOT_ALLOWED"
         )
 
 
-    # -----------------------------------------------------
-    # 3. TOOL ARGUMENT SCHEMA
-    # -----------------------------------------------------
+    # =====================================================
+    # 3. TOOL ARGUMENT SCHEMAS
+    # =====================================================
 
     # =====================================================
     # SEARCH
@@ -272,8 +314,11 @@ async def action_firewall(request: Request):
 
     if tool == "search":
 
-        # EXACT:
+        # EXACTLY:
+        #
         # {"query": "..."}
+        #
+
         if not exact_keys(
             args,
             {"query"}
@@ -285,14 +330,16 @@ async def action_firewall(request: Request):
 
         query = args["query"]
 
-        if not isinstance(query, str):
+        if type(query) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
-        # Query must contain 1-200 characters.
-        if not (1 <= len(query) <= 200):
+        # 1-200 characters inclusive.
+        if not (
+            1 <= len(query) <= 200
+        ):
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
@@ -305,8 +352,14 @@ async def action_firewall(request: Request):
 
     elif tool == "lookup_record":
 
-        # EXACT:
-        # {"tenantId": "...", "recordId": "..."}
+        # EXACTLY:
+        #
+        # {
+        #     "tenantId": "...",
+        #     "recordId": "..."
+        # }
+        #
+
         if not exact_keys(
             args,
             {
@@ -322,19 +375,13 @@ async def action_firewall(request: Request):
         tenant_id = args["tenantId"]
         record_id = args["recordId"]
 
-        if not isinstance(
-            tenant_id,
-            str
-        ):
+        if type(tenant_id) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
-        if not isinstance(
-            record_id,
-            str
-        ):
+        if type(record_id) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
@@ -354,8 +401,15 @@ async def action_firewall(request: Request):
 
     elif tool == "send_email":
 
-        # EXACT:
-        # {"to": "...", "subject": "...", "body": "..."}
+        # EXACTLY:
+        #
+        # {
+        #     "to": "...",
+        #     "subject": "...",
+        #     "body": "..."
+        # }
+        #
+
         if not exact_keys(
             args,
             {
@@ -373,19 +427,19 @@ async def action_firewall(request: Request):
         subject = args["subject"]
         body = args["body"]
 
-        if not isinstance(to, str):
+        if type(to) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
-        if not isinstance(subject, str):
+        if type(subject) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
-        if not isinstance(body, str):
+        if type(body) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
@@ -398,8 +452,11 @@ async def action_firewall(request: Request):
 
     elif tool == "render_html":
 
-        # EXACT:
+        # EXACTLY:
+        #
         # {"html": "..."}
+        #
+
         if not exact_keys(
             args,
             {"html"}
@@ -411,70 +468,117 @@ async def action_firewall(request: Request):
 
         html = args["html"]
 
-        if not isinstance(html, str):
+        if type(html) is not str:
             return firewall_result(
                 "block",
                 "INVALID_SCHEMA"
             )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 4. TENANT SCOPE
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "lookup_record":
 
-        if args["tenantId"] != ASSIGNED_TENANT:
+        tenant_id = args["tenantId"]
+
+        # The tenant must match EXACTLY.
+        #
+        # No prefix matching.
+        # No substring matching.
+        # No case-insensitive matching.
+        # No wildcard.
+        #
+        # Example:
+        #
+        # tenant-lqccake       -> ALLOW
+        # tenant-lqccake-x     -> BLOCK
+        # TENANT-LQCCAKE       -> BLOCK
+        # attacker             -> BLOCK
+
+        if tenant_id != ASSIGNED_TENANT:
+
             return firewall_result(
                 "block",
                 "TENANT_SCOPE"
             )
 
 
-    # -----------------------------------------------------
-    # 5. EMAIL DOMAIN
-    # -----------------------------------------------------
+    # =====================================================
+    # 5. EMAIL DOMAIN / EGRESS
+    # =====================================================
 
     if tool == "send_email":
 
-        if not valid_email_for_domain(
-            args["to"]
-        ):
+        to = args["to"]
+
+        # The recipient domain must match EXACTLY.
+        #
+        # This check happens BEFORE human approval.
+        #
+        # Therefore:
+        #
+        # wrong domain + approved
+        #       -> EGRESS_DENIED
+        #
+        # wrong domain + not approved
+        #       -> EGRESS_DENIED
+        #
+        # correct domain + not approved
+        #       -> APPROVAL_REQUIRED
+        #
+        # correct domain + approved
+        #       -> continue
+
+        if not valid_email_for_domain(to):
+
             return firewall_result(
                 "block",
                 "EGRESS_DENIED"
             )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 6. HUMAN APPROVAL
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "send_email":
 
+        # Email is the side-effecting action.
+        #
+        # It requires explicit:
+        #
+        # "humanApproved": true
+        #
+
         if human_approved is not True:
+
             return firewall_result(
                 "block",
                 "APPROVAL_REQUIRED"
             )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 7. HTML SAFETY
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "render_html":
 
-        if unsafe_html(args["html"]):
+        html = args["html"]
+
+        if unsafe_html(html):
+
             return firewall_result(
                 "block",
                 "UNSAFE_OUTPUT"
             )
 
 
-    # -----------------------------------------------------
-    # ALL CHECKS PASSED
-    # -----------------------------------------------------
+    # =====================================================
+    # EVERYTHING PASSED
+    # =====================================================
 
     return firewall_result(
         "allow",
@@ -517,39 +621,60 @@ STATEFUL_DELETE_TYPES = {
 @app.post("/terraform/plan")
 def terraform_plan(req: TerraformPlanRequest):
 
-    if not isinstance(req.environment, str):
+    if not isinstance(
+        req.environment,
+        str
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
-    if not isinstance(req.state, dict):
+    if not isinstance(
+        req.state,
+        dict
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
-    if not isinstance(req.providerVersion, str):
+    if not isinstance(
+        req.providerVersion,
+        str
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
-    if not isinstance(req.destroyApproved, bool):
+    if not isinstance(
+        req.destroyApproved,
+        bool
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
-    if not isinstance(req.resource, dict):
+    if not isinstance(
+        req.resource,
+        dict
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
     if (
-        not isinstance(req.state.get("backend"), str)
-        or not isinstance(req.state.get("locked"), bool)
+        not isinstance(
+            req.state.get("backend"),
+            str
+        )
+        or not isinstance(
+            req.state.get("locked"),
+            bool
+        )
     ):
         return {
             "decision": "reject",
@@ -558,39 +683,58 @@ def terraform_plan(req: TerraformPlanRequest):
 
     resource = req.resource
 
-    if not isinstance(resource.get("address"), str):
-        return {
-            "decision": "reject",
-            "reason": "INVALID_PLAN",
-        }
-
-    if not isinstance(resource.get("type"), str):
-        return {
-            "decision": "reject",
-            "reason": "INVALID_PLAN",
-        }
-
-    if not isinstance(resource.get("action"), str):
-        return {
-            "decision": "reject",
-            "reason": "INVALID_PLAN",
-        }
-
-    if not isinstance(resource.get("labels"), dict):
-        return {
-            "decision": "reject",
-            "reason": "INVALID_PLAN",
-        }
-
-    if resource.get("secret") is not None and not isinstance(
-        resource.get("secret"), str
+    if not isinstance(
+        resource.get("address"),
+        str
     ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
         }
 
-    if not isinstance(resource.get("forceDestroy"), bool):
+    if not isinstance(
+        resource.get("type"),
+        str
+    ):
+        return {
+            "decision": "reject",
+            "reason": "INVALID_PLAN",
+        }
+
+    if not isinstance(
+        resource.get("action"),
+        str
+    ):
+        return {
+            "decision": "reject",
+            "reason": "INVALID_PLAN",
+        }
+
+    if not isinstance(
+        resource.get("labels"),
+        dict
+    ):
+        return {
+            "decision": "reject",
+            "reason": "INVALID_PLAN",
+        }
+
+    if (
+        resource.get("secret") is not None
+        and not isinstance(
+            resource.get("secret"),
+            str
+        )
+    ):
+        return {
+            "decision": "reject",
+            "reason": "INVALID_PLAN",
+        }
+
+    if not isinstance(
+        resource.get("forceDestroy"),
+        bool
+    ):
         return {
             "decision": "reject",
             "reason": "INVALID_PLAN",
@@ -613,7 +757,8 @@ def terraform_plan(req: TerraformPlanRequest):
         }
 
     if (
-        req.state.get("backend") not in ALLOWED_BACKENDS
+        req.state.get("backend")
+        not in ALLOWED_BACKENDS
         or req.state.get("locked") is not True
     ):
         return {
@@ -661,7 +806,8 @@ def terraform_plan(req: TerraformPlanRequest):
 
     if (
         resource.get("action") == "delete"
-        and resource.get("type") in STATEFUL_DELETE_TYPES
+        and resource.get("type")
+        in STATEFUL_DELETE_TYPES
         and req.destroyApproved is not True
     ):
         return {
