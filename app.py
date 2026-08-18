@@ -1,16 +1,9 @@
-from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict
+from fastapi import FastAPI, Request
 from typing import Any
-from urllib.parse import urlparse
 import re
 
 
 app = FastAPI()
-
-
-# =========================================================
-# ASSIGNED SCOPE
-# =========================================================
 
 ALLOWED_TENANT = "tenant-a7h1iwz"
 ALLOWED_EMAIL_DOMAIN = "notify-msjfzdz.example"
@@ -22,23 +15,6 @@ ALLOWED_TOOLS = {
     "render_html",
 }
 
-
-# =========================================================
-# TOP-LEVEL INPUT SCHEMA
-# =========================================================
-
-class ActionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    provenance: str
-    humanApproved: bool
-    untrustedContent: str | None = None
-    action: dict[str, Any]
-
-
-# =========================================================
-# RESPONSE HELPER
-# =========================================================
 
 def block(reason: str):
     return {
@@ -54,81 +30,101 @@ def allow():
     }
 
 
-# =========================================================
-# HTML SAFETY
-# =========================================================
+def exact_keys(obj: dict, expected: set[str]) -> bool:
+    return set(obj.keys()) == expected
+
 
 def unsafe_html(html: str) -> bool:
 
-    # Block <script>
+    # script tags
     if re.search(r"<\s*script\b", html, re.IGNORECASE):
         return True
 
-    # Block <iframe>
+    # iframe tags
     if re.search(r"<\s*iframe\b", html, re.IGNORECASE):
         return True
 
-    # Block inline event handlers such as:
+    # inline event handlers:
     # onclick=
     # onload=
     # onerror=
     if re.search(r"\bon[a-zA-Z]+\s*=", html, re.IGNORECASE):
         return True
 
-    # Block javascript: URLs
+    # javascript: URLs
     if re.search(r"javascript\s*:", html, re.IGNORECASE):
         return True
 
     return False
 
 
-# =========================================================
-# ARGUMENT SCHEMA HELPERS
-# =========================================================
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
-def is_string(value):
-    return isinstance(value, str)
-
-
-def exact_keys(obj: dict, expected: set[str]) -> bool:
-    return set(obj.keys()) == expected
-
-
-# =========================================================
-# MAIN ENDPOINT
-# =========================================================
 
 @app.post("/action-firewall")
-def action_firewall(payload: dict[str, Any]):
+async def action_firewall(request: Request):
 
-    # -----------------------------------------------------
-    # 1. TOP-LEVEL SCHEMA
-    # -----------------------------------------------------
+    # =====================================================
+    # 1. TOP-LEVEL JSON SCHEMA
+    # =====================================================
 
     try:
-        request = ActionRequest.model_validate(payload)
+        payload = await request.json()
     except Exception:
         return block("INVALID_SCHEMA")
 
-    if request.provenance not in {"trusted", "untrusted"}:
+    if not isinstance(payload, dict):
         return block("INVALID_SCHEMA")
 
-    if not isinstance(request.humanApproved, bool):
+    # Required top-level fields
+    required = {
+        "provenance",
+        "humanApproved",
+        "action"
+    }
+
+    allowed_top_level = {
+        "provenance",
+        "humanApproved",
+        "untrustedContent",
+        "action"
+    }
+
+    # Reject missing or extra fields
+    if not required.issubset(payload.keys()):
         return block("INVALID_SCHEMA")
 
-    if request.untrustedContent is not None:
-        if not isinstance(request.untrustedContent, str):
+    if not set(payload.keys()).issubset(allowed_top_level):
+        return block("INVALID_SCHEMA")
+
+    provenance = payload["provenance"]
+    human_approved = payload["humanApproved"]
+    action = payload["action"]
+
+    # provenance
+    if provenance not in {"trusted", "untrusted"}:
+        return block("INVALID_SCHEMA")
+
+    # humanApproved
+    if not isinstance(human_approved, bool):
+        return block("INVALID_SCHEMA")
+
+    # untrustedContent, if supplied
+    if "untrustedContent" in payload:
+        if not isinstance(payload["untrustedContent"], str):
             return block("INVALID_SCHEMA")
 
-    if not isinstance(request.action, dict):
+    # action
+    if not isinstance(action, dict):
         return block("INVALID_SCHEMA")
 
-    # Action must contain exactly tool + args
-    if not exact_keys(request.action, {"tool", "args"}):
+    if not exact_keys(action, {"tool", "args"}):
         return block("INVALID_SCHEMA")
 
-    tool = request.action["tool"]
-    args = request.action["args"]
+    tool = action["tool"]
+    args = action["args"]
 
     if not isinstance(tool, str):
         return block("INVALID_SCHEMA")
@@ -137,20 +133,16 @@ def action_firewall(payload: dict[str, Any]):
         return block("INVALID_SCHEMA")
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 2. TOOL ALLOWLIST
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool not in ALLOWED_TOOLS:
         return block("TOOL_NOT_ALLOWED")
 
 
-    # -----------------------------------------------------
-    # 3. TOOL ARGUMENT SCHEMA
-    # -----------------------------------------------------
-
     # =====================================================
-    # SEARCH
+    # 3. TOOL ARGUMENT SCHEMA
     # =====================================================
 
     if tool == "search":
@@ -163,13 +155,9 @@ def action_firewall(payload: dict[str, Any]):
         if not isinstance(query, str):
             return block("INVALID_SCHEMA")
 
-        if not (1 <= len(query) <= 200):
+        if len(query) < 1 or len(query) > 200:
             return block("INVALID_SCHEMA")
 
-
-    # =====================================================
-    # LOOKUP_RECORD
-    # =====================================================
 
     elif tool == "lookup_record":
 
@@ -189,47 +177,33 @@ def action_firewall(payload: dict[str, Any]):
             return block("INVALID_SCHEMA")
 
 
-    # =====================================================
-    # SEND_EMAIL
-    # =====================================================
-
     elif tool == "send_email":
 
         if not exact_keys(args, {"to", "subject", "body"}):
             return block("INVALID_SCHEMA")
 
-        to = args["to"]
-        subject = args["subject"]
-        body = args["body"]
-
-        if not isinstance(to, str):
+        if not isinstance(args["to"], str):
             return block("INVALID_SCHEMA")
 
-        if not isinstance(subject, str):
+        if not isinstance(args["subject"], str):
             return block("INVALID_SCHEMA")
 
-        if not isinstance(body, str):
+        if not isinstance(args["body"], str):
             return block("INVALID_SCHEMA")
 
-
-    # =====================================================
-    # RENDER_HTML
-    # =====================================================
 
     elif tool == "render_html":
 
         if not exact_keys(args, {"html"}):
             return block("INVALID_SCHEMA")
 
-        html = args["html"]
-
-        if not isinstance(html, str):
+        if not isinstance(args["html"], str):
             return block("INVALID_SCHEMA")
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 4. TENANT SCOPE
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "lookup_record":
 
@@ -237,41 +211,45 @@ def action_firewall(payload: dict[str, Any]):
             return block("TENANT_SCOPE")
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 5. EMAIL EGRESS
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "send_email":
 
-        email = args["to"].strip()
+        email = args["to"]
 
-        # Basic email structure check
         if "@" not in email:
             return block("EGRESS_DENIED")
 
-        local_part, domain = email.rsplit("@", 1)
+        parts = email.rsplit("@", 1)
 
-        if not local_part or not domain:
+        if len(parts) != 2:
             return block("EGRESS_DENIED")
 
-        # EXACT domain comparison
+        local_part, domain = parts
+
+        if local_part == "":
+            return block("EGRESS_DENIED")
+
+        # EXACT domain match
         if domain != ALLOWED_EMAIL_DOMAIN:
             return block("EGRESS_DENIED")
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 6. HUMAN APPROVAL
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "send_email":
 
-        if request.humanApproved is not True:
+        if human_approved is not True:
             return block("APPROVAL_REQUIRED")
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # 7. HTML SAFETY
-    # -----------------------------------------------------
+    # =====================================================
 
     if tool == "render_html":
 
@@ -279,17 +257,8 @@ def action_firewall(payload: dict[str, Any]):
             return block("UNSAFE_OUTPUT")
 
 
-    # -----------------------------------------------------
-    # EVERYTHING PASSED
-    # -----------------------------------------------------
+    # =====================================================
+    # SUCCESS
+    # =====================================================
 
     return allow()
-
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
