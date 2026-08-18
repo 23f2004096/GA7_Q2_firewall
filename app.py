@@ -1,11 +1,12 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Body, Request
 from pydantic import BaseModel
-from typing import Any, Dict
-import json
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
 import re
 
-app = FastAPI()
 
+app = FastAPI()
 
 # =========================================================
 # ACTION FIREWALL
@@ -14,12 +15,12 @@ app = FastAPI()
 ASSIGNED_TENANT = "tenant-lqccake"
 ALLOWED_EMAIL_DOMAIN = "notify-dm117fp.example"
 
-ALLOWED_TOOLS = {
-    "search",
-    "lookup_record",
-    "send_email",
-    "render_html",
-}
+
+class ActionFirewallRequest(BaseModel):
+    provenance: str
+    humanApproved: bool
+    untrustedContent: str | None = None
+    action: Dict[str, Any]
 
 
 def firewall_result(decision: str, reason: str):
@@ -29,119 +30,49 @@ def firewall_result(decision: str, reason: str):
     }
 
 
-def exact_keys(obj: dict, expected: set[str]) -> bool:
-    return set(obj.keys()) == expected
-
-
-def unsafe_html(html: str) -> bool:
-
-    unsafe_patterns = [
-        r"<\s*script\b",
-        r"</\s*script\s*>",
-        r"<\s*iframe\b",
-        r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
-        r"javascript\s*:",
-    ]
-
-    for pattern in unsafe_patterns:
-        if re.search(pattern, html, re.IGNORECASE):
-            return True
-
-    return False
-
-
-def valid_email_for_domain(email: str) -> bool:
-
-    pattern = (
-        r"^[^@\s]+@"
-        + re.escape(ALLOWED_EMAIL_DOMAIN)
-        + r"$"
-    )
-
-    return re.fullmatch(pattern, email) is not None
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-
 @app.post("/action-firewall")
-async def action_firewall(request: Request):
+def action_firewall(req: ActionFirewallRequest):
 
     # ---------------------------------------------------------
     # 1. Top-level schema
     # ---------------------------------------------------------
 
-    try:
-        raw_body = await request.body()
-        payload = json.loads(raw_body)
-    except Exception:
+    if req.provenance not in ("trusted", "untrusted"):
         return firewall_result("block", "INVALID_SCHEMA")
 
-    if not isinstance(payload, dict):
+    if not isinstance(req.humanApproved, bool):
         return firewall_result("block", "INVALID_SCHEMA")
 
-    required_keys = {
-        "provenance",
-        "humanApproved",
-        "action",
-    }
-
-    allowed_keys = {
-        "provenance",
-        "humanApproved",
-        "untrustedContent",
-        "action",
-    }
-
-    if not required_keys.issubset(payload.keys()):
+    if req.untrustedContent is not None and not isinstance(
+        req.untrustedContent, str
+    ):
         return firewall_result("block", "INVALID_SCHEMA")
 
-    if not set(payload.keys()).issubset(allowed_keys):
+    if not isinstance(req.action, dict):
         return firewall_result("block", "INVALID_SCHEMA")
 
-    if not isinstance(payload["provenance"], str):
+    if "tool" not in req.action or "args" not in req.action:
         return firewall_result("block", "INVALID_SCHEMA")
 
-    if payload["provenance"] not in {
-        "trusted",
-        "untrusted",
-    }:
+    tool = req.action["tool"]
+    args = req.action["args"]
+
+    if not isinstance(tool, str) or not isinstance(args, dict):
         return firewall_result("block", "INVALID_SCHEMA")
-
-    if not isinstance(payload["humanApproved"], bool):
-        return firewall_result("block", "INVALID_SCHEMA")
-
-    if "untrustedContent" in payload:
-        if not isinstance(payload["untrustedContent"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-    action = payload["action"]
-
-    if not isinstance(action, dict):
-        return firewall_result("block", "INVALID_SCHEMA")
-
-    if not exact_keys(action, {"tool", "args"}):
-        return firewall_result("block", "INVALID_SCHEMA")
-
-    tool = action["tool"]
-    args = action["args"]
-
-    if not isinstance(tool, str):
-        return firewall_result("block", "INVALID_SCHEMA")
-
-    if not isinstance(args, dict):
-        return firewall_result("block", "INVALID_SCHEMA")
-
 
     # ---------------------------------------------------------
     # 2. Tool allowlist
     # ---------------------------------------------------------
 
-    if tool not in ALLOWED_TOOLS:
-        return firewall_result("block", "TOOL_NOT_ALLOWED")
+    allowed_tools = {
+        "search",
+        "lookup_record",
+        "send_email",
+        "render_html",
+    }
 
+    if tool not in allowed_tools:
+        return firewall_result("block", "TOOL_NOT_ALLOWED")
 
     # ---------------------------------------------------------
     # 3. Tool argument schemas
@@ -149,54 +80,40 @@ async def action_firewall(request: Request):
 
     if tool == "search":
 
-        if not exact_keys(args, {"query"}):
+        if (
+            set(args.keys()) != {"query"}
+            or not isinstance(args.get("query"), str)
+            or not (1 <= len(args["query"]) <= 200)
+        ):
             return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["query"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-        if not 1 <= len(args["query"]) <= 200:
-            return firewall_result("block", "INVALID_SCHEMA")
-
 
     elif tool == "lookup_record":
 
-        if not exact_keys(args, {"tenantId", "recordId"}):
+        if (
+            set(args.keys()) != {"tenantId", "recordId"}
+            or not isinstance(args.get("tenantId"), str)
+            or not isinstance(args.get("recordId"), str)
+            or args["recordId"] == ""
+        ):
             return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["tenantId"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["recordId"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-        if args["recordId"] == "":
-            return firewall_result("block", "INVALID_SCHEMA")
-
 
     elif tool == "send_email":
 
-        if not exact_keys(args, {"to", "subject", "body"}):
+        if (
+            set(args.keys()) != {"to", "subject", "body"}
+            or not isinstance(args.get("to"), str)
+            or not isinstance(args.get("subject"), str)
+            or not isinstance(args.get("body"), str)
+        ):
             return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["to"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["subject"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["body"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
 
     elif tool == "render_html":
 
-        if not exact_keys(args, {"html"}):
+        if (
+            set(args.keys()) != {"html"}
+            or not isinstance(args.get("html"), str)
+        ):
             return firewall_result("block", "INVALID_SCHEMA")
-
-        if not isinstance(args["html"], str):
-            return firewall_result("block", "INVALID_SCHEMA")
-
 
     # ---------------------------------------------------------
     # 4. Tenant scope
@@ -207,16 +124,21 @@ async def action_firewall(request: Request):
         if args["tenantId"] != ASSIGNED_TENANT:
             return firewall_result("block", "TENANT_SCOPE")
 
-
     # ---------------------------------------------------------
-    # 5. Egress
+    # 5. Egress restrictions
     # ---------------------------------------------------------
 
     if tool == "send_email":
 
-        if not valid_email_for_domain(args["to"]):
+        to = args["to"]
+
+        if "@" not in to:
             return firewall_result("block", "EGRESS_DENIED")
 
+        domain = to.rsplit("@", 1)[1]
+
+        if domain != ALLOWED_EMAIL_DOMAIN:
+            return firewall_result("block", "EGRESS_DENIED")
 
     # ---------------------------------------------------------
     # 6. Human approval
@@ -224,12 +146,8 @@ async def action_firewall(request: Request):
 
     if tool == "send_email":
 
-        if payload["humanApproved"] is not True:
-            return firewall_result(
-                "block",
-                "APPROVAL_REQUIRED"
-            )
-
+        if req.humanApproved is not True:
+            return firewall_result("block", "APPROVAL_REQUIRED")
 
     # ---------------------------------------------------------
     # 7. HTML safety
@@ -237,15 +155,23 @@ async def action_firewall(request: Request):
 
     if tool == "render_html":
 
-        if unsafe_html(args["html"]):
-            return firewall_result(
-                "block",
-                "UNSAFE_OUTPUT"
-            )
+        html_value = args["html"]
 
+        unsafe_patterns = [
+            r"<script\b",
+            r"</script\s*>",
+            r"<iframe\b",
+            r"\bon[a-z]+\s*=",
+            r"javascript\s*:",
+        ]
 
-    # ---------------------------------------------------------
-    # Everything passed
-    # ---------------------------------------------------------
+        for pattern in unsafe_patterns:
+
+            if re.search(
+                pattern,
+                html_value,
+                flags=re.IGNORECASE,
+            ):
+                return firewall_result("block", "UNSAFE_OUTPUT")
 
     return firewall_result("allow", "ALLOW")
