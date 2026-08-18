@@ -1,93 +1,11 @@
-from fastapi import FastAPI, Body, Request
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
-from urllib.parse import unquote, urlsplit
+from typing import Any, Dict
+import json
 import re
 
 
 app = FastAPI()
-
-
-# =========================================================
-# Q1 / RELEASE GATE
-# =========================================================
-
-class ReleaseGateRequest(BaseModel):
-    target: str
-    event: str
-    ref: str
-    workflow: Dict[str, Any]
-    image: Dict[str, Any]
-
-
-@app.post("/release-gate")
-def release_gate(req: ReleaseGateRequest):
-    violations: List[str] = []
-
-    workflow = req.workflow
-    image = req.image
-
-    expected_permissions = {
-        "contents": "read",
-        "packages": "write",
-        "id-token": "none",
-    }
-
-    if workflow.get("permissions") != expected_permissions:
-        violations.append("EXCESS_PERMISSION")
-
-    if req.event == "pull_request":
-        if workflow.get("trigger") != "pull_request":
-            violations.append("UNSAFE_PR_TRIGGER")
-
-    elif workflow.get("trigger") == "pull_request_target":
-        violations.append("UNSAFE_PR_TRIGGER")
-
-    if (
-        workflow.get("testsPassed") is not True
-        or workflow.get("matrixComplete") is not True
-        or workflow.get("failFast") is not False
-    ):
-        violations.append("TESTS_INCOMPLETE")
-
-    sha_pattern = re.compile(r"^[0-9a-f]{40}$")
-
-    for action in workflow.get("actions", []):
-        if action.get("owner") != "actions":
-            ref = action.get("ref")
-
-            if not isinstance(ref, str) or not sha_pattern.fullmatch(ref):
-                violations.append("MUTABLE_ACTION")
-                break
-
-    if image.get("multiStage") is not True:
-        violations.append("SINGLE_STAGE_IMAGE")
-
-    if image.get("runsAsRoot") is not False:
-        violations.append("ROOT_RUNTIME")
-
-    if image.get("secretMode") not in ("none", "buildkit"):
-        violations.append("SECRET_IN_LAYER")
-
-    if image.get("criticalVulnerabilities") != 0:
-        violations.append("CRITICAL_CVE")
-
-    if image.get("digestPinned") is not True:
-        violations.append("UNPINNED_IMAGE")
-
-    if req.target == "production":
-
-        if req.event != "push" or req.ref != "refs/heads/main":
-            violations.append("INVALID_PRODUCTION_REF")
-
-        if workflow.get("environmentApproval") is not True:
-            violations.append("APPROVAL_REQUIRED")
-
-    return {
-        "decision": "promote" if not violations else "block",
-        "violations": violations,
-    }
 
 
 # =========================================================
@@ -97,12 +15,12 @@ def release_gate(req: ReleaseGateRequest):
 ASSIGNED_TENANT = "tenant-lqccake"
 ALLOWED_EMAIL_DOMAIN = "notify-dm117fp.example"
 
-
-class ActionFirewallRequest(BaseModel):
-    provenance: str
-    humanApproved: bool
-    untrustedContent: str | None = None
-    action: Dict[str, Any]
+ALLOWED_TOOLS = {
+    "search",
+    "lookup_record",
+    "send_email",
+    "render_html",
+}
 
 
 def firewall_result(decision: str, reason: str):
@@ -112,151 +30,456 @@ def firewall_result(decision: str, reason: str):
     }
 
 
-@app.post("/action-firewall")
-def action_firewall(req: ActionFirewallRequest):
+def exact_keys(obj: dict, expected: set[str]) -> bool:
+    return set(obj.keys()) == expected
 
-    # ---------------------------------------------------------
-    # 1. Top-level schema
-    # ---------------------------------------------------------
 
-    if req.provenance not in ("trusted", "untrusted"):
-        return firewall_result("block", "INVALID_SCHEMA")
+def unsafe_html(html: str) -> bool:
+    """
+    Block:
+      - <script>
+      - </script>
+      - <iframe>
+      - inline event handlers such as onclick=, onerror=, onload=
+      - javascript: URLs
 
-    if not isinstance(req.humanApproved, bool):
-        return firewall_result("block", "INVALID_SCHEMA")
+    IMPORTANT:
+      data: URIs are intentionally allowed.
+    """
 
-    if req.untrustedContent is not None and not isinstance(
-        req.untrustedContent, str
-    ):
-        return firewall_result("block", "INVALID_SCHEMA")
+    unsafe_patterns = [
+        # Script tags
+        r"<\s*script\b",
 
-    if not isinstance(req.action, dict):
-        return firewall_result("block", "INVALID_SCHEMA")
+        # Closing script tags
+        r"</\s*script\s*>",
 
-    if "tool" not in req.action or "args" not in req.action:
-        return firewall_result("block", "INVALID_SCHEMA")
+        # Iframe tags
+        r"<\s*iframe\b",
 
-    tool = req.action["tool"]
-    args = req.action["args"]
+        # Inline event handlers:
+        # onclick=
+        # onload=
+        # onerror=
+        # onmouseover=
+        # onanimationstart=
+        # etc.
+        r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
 
-    if not isinstance(tool, str) or not isinstance(args, dict):
-        return firewall_result("block", "INVALID_SCHEMA")
+        # javascript: URLs
+        r"javascript\s*:",
+    ]
 
-    # ---------------------------------------------------------
-    # 2. Tool allowlist
-    # ---------------------------------------------------------
+    for pattern in unsafe_patterns:
+        if re.search(pattern, html, flags=re.IGNORECASE):
+            return True
 
-    allowed_tools = {
-        "search",
-        "lookup_record",
-        "send_email",
-        "render_html",
+    return False
+
+
+def valid_email_for_domain(email: str) -> bool:
+    """
+    Recipient must have exactly the assigned domain.
+
+    Allowed:
+        person@notify-dm117fp.example
+
+    Block:
+        person@gmail.com
+        person@evilnotify-dm117fp.example
+        person@notify-dm117fp.example.evil.com
+        person@@notify-dm117fp.example
+        @notify-dm117fp.example
+
+    """
+
+    pattern = (
+        r"^[^@\s]+@"
+        + re.escape(ALLOWED_EMAIL_DOMAIN)
+        + r"$"
+    )
+
+    return re.fullmatch(pattern, email) is not None
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok"
     }
 
-    if tool not in allowed_tools:
-        return firewall_result("block", "TOOL_NOT_ALLOWED")
 
-    # ---------------------------------------------------------
-    # 3. Tool argument schemas
-    # ---------------------------------------------------------
+# =========================================================
+# ACTION FIREWALL ENDPOINT
+# =========================================================
+
+@app.post("/action-firewall")
+async def action_firewall(request: Request):
+
+    # -----------------------------------------------------
+    # 1. TOP-LEVEL SCHEMA
+    # -----------------------------------------------------
+
+    # Read raw request body ourselves.
+    # This prevents FastAPI/Pydantic from returning
+    # its own 422 response for malformed JSON.
+    try:
+        raw_body = await request.body()
+        payload = json.loads(raw_body)
+    except Exception:
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # Top-level must be a JSON object.
+    if not isinstance(payload, dict):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    required_keys = {
+        "provenance",
+        "humanApproved",
+        "action",
+    }
+
+    allowed_top_level_keys = {
+        "provenance",
+        "humanApproved",
+        "untrustedContent",
+        "action",
+    }
+
+    # Missing required fields
+    if not required_keys.issubset(payload.keys()):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # Extra top-level fields
+    if not set(payload.keys()).issubset(
+        allowed_top_level_keys
+    ):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # provenance
+    provenance = payload["provenance"]
+
+    if not isinstance(provenance, str):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    if provenance not in {
+        "trusted",
+        "untrusted",
+    }:
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # humanApproved
+    human_approved = payload["humanApproved"]
+
+    if not isinstance(human_approved, bool):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # Optional untrustedContent
+    if "untrustedContent" in payload:
+
+        if not isinstance(
+            payload["untrustedContent"],
+            str
+        ):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+    # action
+    action = payload["action"]
+
+    if not isinstance(action, dict):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    # Action must contain EXACTLY:
+    #
+    # {
+    #     "tool": "...",
+    #     "args": {...}
+    # }
+
+    if not exact_keys(
+        action,
+        {
+            "tool",
+            "args",
+        }
+    ):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    tool = action["tool"]
+    args = action["args"]
+
+    if not isinstance(tool, str):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+    if not isinstance(args, dict):
+        return firewall_result(
+            "block",
+            "INVALID_SCHEMA"
+        )
+
+
+    # -----------------------------------------------------
+    # 2. TOOL ALLOWLIST
+    # -----------------------------------------------------
+
+    if tool not in ALLOWED_TOOLS:
+        return firewall_result(
+            "block",
+            "TOOL_NOT_ALLOWED"
+        )
+
+
+    # -----------------------------------------------------
+    # 3. TOOL ARGUMENT SCHEMA
+    # -----------------------------------------------------
+
+    # =====================================================
+    # SEARCH
+    # =====================================================
 
     if tool == "search":
 
-        if (
-            set(args.keys()) != {"query"}
-            or not isinstance(args.get("query"), str)
-            or not (1 <= len(args["query"]) <= 200)
+        # EXACT:
+        # {"query": "..."}
+        if not exact_keys(
+            args,
+            {"query"}
         ):
-            return firewall_result("block", "INVALID_SCHEMA")
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        query = args["query"]
+
+        if not isinstance(query, str):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        # Query must contain 1-200 characters.
+        if not (1 <= len(query) <= 200):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+
+    # =====================================================
+    # LOOKUP RECORD
+    # =====================================================
 
     elif tool == "lookup_record":
 
-        if (
-            set(args.keys()) != {"tenantId", "recordId"}
-            or not isinstance(args.get("tenantId"), str)
-            or not isinstance(args.get("recordId"), str)
-            or args["recordId"] == ""
+        # EXACT:
+        # {"tenantId": "...", "recordId": "..."}
+        if not exact_keys(
+            args,
+            {
+                "tenantId",
+                "recordId",
+            }
         ):
-            return firewall_result("block", "INVALID_SCHEMA")
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        tenant_id = args["tenantId"]
+        record_id = args["recordId"]
+
+        if not isinstance(
+            tenant_id,
+            str
+        ):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        if not isinstance(
+            record_id,
+            str
+        ):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        # recordId must be non-empty.
+        if record_id == "":
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+
+    # =====================================================
+    # SEND EMAIL
+    # =====================================================
 
     elif tool == "send_email":
 
-        if (
-            set(args.keys()) != {"to", "subject", "body"}
-            or not isinstance(args.get("to"), str)
-            or not isinstance(args.get("subject"), str)
-            or not isinstance(args.get("body"), str)
+        # EXACT:
+        # {"to": "...", "subject": "...", "body": "..."}
+        if not exact_keys(
+            args,
+            {
+                "to",
+                "subject",
+                "body",
+            }
         ):
-            return firewall_result("block", "INVALID_SCHEMA")
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        to = args["to"]
+        subject = args["subject"]
+        body = args["body"]
+
+        if not isinstance(to, str):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        if not isinstance(subject, str):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+        if not isinstance(body, str):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+
+    # =====================================================
+    # RENDER HTML
+    # =====================================================
 
     elif tool == "render_html":
 
-        if (
-            set(args.keys()) != {"html"}
-            or not isinstance(args.get("html"), str)
+        # EXACT:
+        # {"html": "..."}
+        if not exact_keys(
+            args,
+            {"html"}
         ):
-            return firewall_result("block", "INVALID_SCHEMA")
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
 
-    # ---------------------------------------------------------
-    # 4. Tenant scope
-    # ---------------------------------------------------------
+        html = args["html"]
+
+        if not isinstance(html, str):
+            return firewall_result(
+                "block",
+                "INVALID_SCHEMA"
+            )
+
+
+    # -----------------------------------------------------
+    # 4. TENANT SCOPE
+    # -----------------------------------------------------
 
     if tool == "lookup_record":
 
         if args["tenantId"] != ASSIGNED_TENANT:
-            return firewall_result("block", "TENANT_SCOPE")
+            return firewall_result(
+                "block",
+                "TENANT_SCOPE"
+            )
 
-    # ---------------------------------------------------------
-    # 5. Egress restrictions
-    # ---------------------------------------------------------
 
-    if tool == "send_email":
-
-        to = args["to"]
-
-        if "@" not in to:
-            return firewall_result("block", "EGRESS_DENIED")
-
-        domain = to.rsplit("@", 1)[1]
-
-        if domain != ALLOWED_EMAIL_DOMAIN:
-            return firewall_result("block", "EGRESS_DENIED")
-
-    # ---------------------------------------------------------
-    # 6. Human approval
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 5. EMAIL DOMAIN
+    # -----------------------------------------------------
 
     if tool == "send_email":
 
-        if req.humanApproved is not True:
-            return firewall_result("block", "APPROVAL_REQUIRED")
+        if not valid_email_for_domain(
+            args["to"]
+        ):
+            return firewall_result(
+                "block",
+                "EGRESS_DENIED"
+            )
 
-    # ---------------------------------------------------------
-    # 7. HTML safety
-    # ---------------------------------------------------------
+
+    # -----------------------------------------------------
+    # 6. HUMAN APPROVAL
+    # -----------------------------------------------------
+
+    if tool == "send_email":
+
+        if human_approved is not True:
+            return firewall_result(
+                "block",
+                "APPROVAL_REQUIRED"
+            )
+
+
+    # -----------------------------------------------------
+    # 7. HTML SAFETY
+    # -----------------------------------------------------
 
     if tool == "render_html":
 
-        html_value = args["html"]
+        if unsafe_html(args["html"]):
+            return firewall_result(
+                "block",
+                "UNSAFE_OUTPUT"
+            )
 
-        unsafe_patterns = [
-            r"<script\b",
-            r"</script\s*>",
-            r"<iframe\b",
-            r"\bon[a-z]+\s*=",
-            r"javascript\s*:",
-        ]
 
-        for pattern in unsafe_patterns:
+    # -----------------------------------------------------
+    # ALL CHECKS PASSED
+    # -----------------------------------------------------
 
-            if re.search(
-                pattern,
-                html_value,
-                flags=re.IGNORECASE,
-            ):
-                return firewall_result("block", "UNSAFE_OUTPUT")
-
-    return firewall_result("allow", "ALLOW")
+    return firewall_result(
+        "allow",
+        "ALLOW"
+    )
 
 
 # =========================================================
@@ -458,773 +681,4 @@ def terraform_plan(req: TerraformPlanRequest):
     return {
         "decision": "approve",
         "reason": "APPROVE",
-    }
-
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.get("/")
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok"
-    }
-
-
-# =========================================================
-# LLM OUTPUT HANDLING GATE
-# /sanitize-output
-# =========================================================
-
-ALLOWED_EXTERNAL_HOSTS = {
-    "cdn-wko562a.example",
-    "app-koyam7o.example",
-}
-
-VALID_CHANNELS = {
-    "html",
-    "markdown",
-    "url",
-    "sql",
-    "shell",
-}
-
-
-def decode_once(value: str) -> str:
-
-    # ---------------------------------------------------------
-    # 1. Percent decoding
-    # ---------------------------------------------------------
-
-    decoded = unquote(value)
-
-    # ---------------------------------------------------------
-    # 2. HTML entity decoding
-    # ---------------------------------------------------------
-
-    def replace_entity(match):
-
-        entity = match.group(0)
-        lower = entity.lower()
-
-        if lower.startswith("&#x"):
-
-            try:
-                return chr(int(entity[3:-1], 16))
-            except ValueError:
-                return entity
-
-        if lower.startswith("&#"):
-
-            try:
-                return chr(int(entity[2:-1], 10))
-            except ValueError:
-                return entity
-
-        named = {
-            "&lt;": "<",
-            "&gt;": ">",
-            "&quot;": '"',
-            "&apos;": "'",
-            "&amp;": "&",
-        }
-
-        return named.get(lower, entity)
-
-    decoded = re.sub(
-        r"&#x[0-9a-fA-F]+;|&#[0-9]+;|"
-        r"&lt;|&gt;|&quot;|&apos;|&amp;",
-        replace_entity,
-        decoded,
-        flags=re.IGNORECASE,
-    )
-
-    # ---------------------------------------------------------
-    # 3. Unicode \uXXXX decoding
-    # ---------------------------------------------------------
-
-    decoded = re.sub(
-        r"\\u([0-9a-fA-F]{4})",
-        lambda m: chr(int(m.group(1), 16)),
-        decoded,
-    )
-
-    return decoded
-
-
-def contains_dangerous_scheme(text: str) -> bool:
-
-    return bool(
-        re.search(
-            r"(?:javascript|data|vbscript)\s*:",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def extract_urls(channel: str, output: str):
-
-    # ---------------------------------------------------------
-    # HTML
-    # ---------------------------------------------------------
-
-    if channel == "html":
-
-        pattern = (
-            r"""\b(?:src|href)\s*=\s*"""
-            r"""(?:"([^"]*)"|'([^']*)')"""
-        )
-
-        result = []
-
-        for match in re.finditer(
-            pattern,
-            output,
-            flags=re.IGNORECASE,
-        ):
-
-            value = (
-                match.group(1)
-                if match.group(1) is not None
-                else match.group(2)
-            )
-
-            result.append(value)
-
-        return result
-
-    # ---------------------------------------------------------
-    # Markdown
-    # ---------------------------------------------------------
-
-    if channel == "markdown":
-
-        result = []
-
-        for match in re.finditer(
-            r"\]\(([^)]*)\)",
-            output,
-        ):
-
-            value = match.group(1).strip()
-
-            if not value:
-                result.append("")
-                continue
-
-            if value.startswith("<"):
-
-                end_idx = value.find(">")
-
-                if end_idx != -1:
-                    url = value[1:end_idx]
-                else:
-                    url = value[1:]
-
-            else:
-
-                parts = value.split(None, 1)
-                url = parts[0] if parts else ""
-
-            result.append(url.strip())
-
-        return result
-
-    # ---------------------------------------------------------
-    # URL
-    # ---------------------------------------------------------
-
-    if channel == "url":
-        return [output.strip()]
-
-    return []
-
-
-def url_has_dangerous_scheme(url: str) -> bool:
-
-    value = url.strip()
-
-    # Protocol-relative URLs are not themselves
-    # dangerous schemes.
-    if value.startswith("//"):
-        return False
-
-    parsed = urlsplit(value)
-
-    if not parsed.scheme:
-        return False
-
-    return parsed.scheme.lower() not in {
-        "http",
-        "https",
-    }
-
-
-def url_is_external_exfil(url: str) -> bool:
-
-    value = url.strip()
-
-    # Relative reference
-    if value.startswith("/") and not value.startswith("//"):
-        return False
-
-    # Protocol-relative reference
-    if value.startswith("//"):
-        parsed = urlsplit("https:" + value)
-
-    else:
-        parsed = urlsplit(value)
-
-    # Relative reference
-    if not parsed.scheme:
-        return False
-
-    hostname = parsed.hostname
-
-    if hostname is None:
-        return True
-
-    return hostname.lower() not in {
-        host.lower()
-        for host in ALLOWED_EXTERNAL_HOSTS
-    }
-
-
-def channel_violation(
-    channel: str,
-    output: str,
-):
-
-    # =========================================================
-    # HTML
-    # =========================================================
-
-    if channel == "html":
-
-        # 1. SCRIPT_TAG
-
-        if re.search(
-            r"<\s*(script|iframe|object|embed)\b",
-            output,
-            flags=re.IGNORECASE,
-        ):
-            return "SCRIPT_TAG"
-
-        # 2. EVENT_HANDLER
-
-        if re.search(
-            r"\bon[a-z]+\s*=",
-            output,
-            flags=re.IGNORECASE,
-        ):
-            return "EVENT_HANDLER"
-
-        # 3. DANGEROUS_SCHEME
-
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
-
-        urls = extract_urls(
-            "html",
-            output,
-        )
-
-        for url in urls:
-
-            if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
-
-        # 4. EXTERNAL_EXFIL
-
-        for url in urls:
-
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
-
-        return None
-
-    # =========================================================
-    # MARKDOWN
-    # =========================================================
-
-    if channel == "markdown":
-
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
-
-        urls = extract_urls(
-            "markdown",
-            output,
-        )
-
-        for url in urls:
-
-            if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
-
-        for url in urls:
-
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
-
-        return None
-
-    # =========================================================
-    # URL
-    # =========================================================
-
-    if channel == "url":
-
-        if contains_dangerous_scheme(output):
-            return "DANGEROUS_SCHEME"
-
-        urls = extract_urls(
-            "url",
-            output,
-        )
-
-        for url in urls:
-
-            if url_has_dangerous_scheme(url):
-                return "DANGEROUS_SCHEME"
-
-        for url in urls:
-
-            if url_is_external_exfil(url):
-                return "EXTERNAL_EXFIL"
-
-        return None
-
-    # =========================================================
-    # SQL
-    # =========================================================
-
-    if channel == "sql":
-
-        if re.search(
-            r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
-            output,
-            flags=re.IGNORECASE,
-        ):
-            return "SQL_METACHAR"
-
-        return None
-
-    # =========================================================
-    # SHELL
-    # =========================================================
-
-    if channel == "shell":
-
-        if re.search(
-            r"""[;&|`<>]|\$\(|\$\{""",
-            output,
-        ):
-            return "SHELL_METACHAR"
-
-        return None
-
-    return None
-
-
-@app.post("/sanitize-output")
-async def sanitize_output(request: Request):
-
-    # =========================================================
-    # Rule 1: INVALID_SCHEMA
-    # =========================================================
-
-    try:
-        body = await request.json()
-
-    except Exception:
-
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA",
-        }
-
-    if not isinstance(body, dict):
-
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA",
-        }
-
-    channel = body.get("channel")
-    output = body.get("output")
-
-    if channel not in VALID_CHANNELS:
-
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA",
-        }
-
-    if not isinstance(output, str):
-
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA",
-        }
-
-    if len(output) > 20000:
-
-        return {
-            "safe": False,
-            "reason": "INVALID_SCHEMA",
-        }
-
-    # =========================================================
-    # Rule 2: ENCODED_PAYLOAD
-    # =========================================================
-
-    decoded = decode_once(output)
-
-    if decoded != output:
-
-        decoded_violation = channel_violation(
-            channel,
-            decoded,
-        )
-
-        if decoded_violation is not None:
-
-            return {
-                "safe": False,
-                "reason": "ENCODED_PAYLOAD",
-            }
-
-    # =========================================================
-    # Rule 3: Original output
-    # =========================================================
-
-    violation = channel_violation(
-        channel,
-        output,
-    )
-
-    if violation is not None:
-
-        return {
-            "safe": False,
-            "reason": violation,
-        }
-
-    return {
-        "safe": True,
-        "reason": "SAFE",
-    }
-
-
-# =========================================================
-# CORROBORATION
-# =========================================================
-
-class Claim(BaseModel):
-    subject: Optional[str] = None
-    predicate: Optional[str] = None
-    value: Any = None
-
-
-class Source(BaseModel):
-    id: Any = None
-    type: Any = None
-    origin: Any = None
-    observedAt: Any = None
-    value: Any = None
-    authoritative: Any = False
-
-
-class CorroborateRequest(BaseModel):
-    claim: Any = None
-    asOf: Any = None
-    stalenessDays: Any = None
-    sources: Any = None
-
-
-VALID_TYPES = {
-    "dns",
-    "ct_log",
-    "registry",
-    "archive",
-    "scan",
-}
-
-
-def parse_timestamp(value):
-
-    if not isinstance(value, str):
-        return None
-
-    try:
-
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-
-    except Exception:
-
-        return None
-
-
-def is_fresh(
-    observed_at,
-    as_of,
-    staleness_days,
-):
-
-    observed = parse_timestamp(
-        observed_at
-    )
-
-    if observed is None:
-        return False
-
-    if observed.tzinfo is None:
-        observed = observed.replace(
-            tzinfo=timezone.utc
-        )
-
-    if as_of.tzinfo is None:
-        as_of = as_of.replace(
-            tzinfo=timezone.utc
-        )
-
-    age_seconds = (
-        as_of - observed
-    ).total_seconds()
-
-    if age_seconds < 0:
-        return True
-
-    return (
-        age_seconds
-        <= staleness_days * 86400
-    )
-
-
-@app.post("/corroborate")
-def corroborate(body: Any = Body(...)):
-
-    # Rule 1: invalid
-
-    if not isinstance(body, dict):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    claim = body.get("claim")
-
-    if not isinstance(claim, dict):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    claim_value = claim.get("value")
-
-    if not isinstance(claim_value, str):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    as_of_raw = body.get("asOf")
-
-    if not isinstance(as_of_raw, str):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    as_of = parse_timestamp(
-        as_of_raw
-    )
-
-    if as_of is None:
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    staleness_days = body.get(
-        "stalenessDays"
-    )
-
-    if (
-        not isinstance(
-            staleness_days,
-            (int, float),
-        )
-        or isinstance(
-            staleness_days,
-            bool,
-        )
-    ):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    sources = body.get("sources")
-
-    if not isinstance(sources, list):
-
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": [],
-        }
-
-    valid_sources = []
-
-    for source in sources:
-
-        if not isinstance(source, dict):
-            continue
-
-        source_id = source.get("id")
-        source_type = source.get("type")
-        origin = source.get("origin")
-        observed_at = source.get("observedAt")
-        value = source.get("value")
-
-        if not isinstance(
-            source_id,
-            str,
-        ):
-            continue
-
-        if not isinstance(
-            origin,
-            str,
-        ):
-            continue
-
-        if not isinstance(
-            value,
-            str,
-        ):
-            continue
-
-        if not isinstance(
-            observed_at,
-            str,
-        ):
-            continue
-
-        if source_type not in VALID_TYPES:
-            continue
-
-        valid_sources.append(source)
-
-    # Authoritative contradiction
-
-    contradicting = []
-
-    for source in valid_sources:
-
-        if not is_fresh(
-            source["observedAt"],
-            as_of,
-            staleness_days,
-        ):
-            continue
-
-        if source.get(
-            "authoritative"
-        ) is True:
-
-            if source["value"] != claim_value:
-                contradicting.append(
-                    source["id"]
-                )
-
-    if contradicting:
-
-        return {
-            "verdict": "contradicted",
-            "confidence": "low",
-            "corroboratingSources": sorted(
-                contradicting
-            ),
-        }
-
-    # Supporting evidence
-
-    matching_fresh = []
-
-    for source in valid_sources:
-
-        if not is_fresh(
-            source["observedAt"],
-            as_of,
-            staleness_days,
-        ):
-            continue
-
-        if source["value"] == claim_value:
-            matching_fresh.append(source)
-
-    representatives = {}
-
-    for source in matching_fresh:
-
-        origin = source["origin"]
-
-        if (
-            origin not in representatives
-            or source["id"]
-            < representatives[origin]["id"]
-        ):
-            representatives[origin] = source
-
-    reps = list(
-        representatives.values()
-    )
-
-    if len(reps) >= 2:
-
-        distinct_types = {
-            source["type"]
-            for source in reps
-        }
-
-        if len(distinct_types) >= 2:
-            confidence = "high"
-        else:
-            confidence = "medium"
-
-        ids = sorted(
-            source["id"]
-            for source in reps
-        )
-
-        return {
-            "verdict": "supported",
-            "confidence": confidence,
-            "corroboratingSources": ids,
-        }
-
-    return {
-        "verdict": "unverified",
-        "confidence": "low",
-        "corroboratingSources": [],
     }
