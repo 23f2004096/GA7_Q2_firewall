@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
-from typing import Any
+from fastapi.responses import JSONResponse
+import json
 import re
-
 
 app = FastAPI()
 
@@ -16,43 +16,42 @@ ALLOWED_TOOLS = {
 }
 
 
-def block(reason: str):
-    return {
-        "decision": "block",
-        "reason": reason
-    }
+def result(decision, reason):
+    return JSONResponse(
+        content={
+            "decision": decision,
+            "reason": reason
+        }
+    )
+
+
+def block(reason):
+    return result("block", reason)
 
 
 def allow():
-    return {
-        "decision": "allow",
-        "reason": "ALLOW"
-    }
+    return result("allow", "ALLOW")
 
 
-def exact_keys(obj: dict, expected: set[str]) -> bool:
-    return set(obj.keys()) == expected
+def exact_keys(obj, expected):
+    return isinstance(obj, dict) and set(obj.keys()) == expected
 
 
-def unsafe_html(html: str) -> bool:
-
-    # script tags
-    if re.search(r"<\s*script\b", html, re.IGNORECASE):
+def unsafe_html(html):
+    # script
+    if re.search(r"<\s*script\b", html, re.I):
         return True
 
-    # iframe tags
-    if re.search(r"<\s*iframe\b", html, re.IGNORECASE):
+    # iframe
+    if re.search(r"<\s*iframe\b", html, re.I):
         return True
 
-    # inline event handlers:
-    # onclick=
-    # onload=
-    # onerror=
-    if re.search(r"\bon[a-zA-Z]+\s*=", html, re.IGNORECASE):
+    # inline event handlers: onclick, onload, onerror, etc.
+    if re.search(r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=", html, re.I):
         return True
 
     # javascript: URLs
-    if re.search(r"javascript\s*:", html, re.IGNORECASE):
+    if re.search(r"javascript\s*:", html, re.I):
         return True
 
     return False
@@ -67,56 +66,52 @@ def root():
 async def action_firewall(request: Request):
 
     # =====================================================
-    # 1. TOP-LEVEL JSON SCHEMA
+    # 1. TOP-LEVEL SCHEMA
     # =====================================================
 
     try:
-        payload = await request.json()
+        raw = await request.body()
+        payload = json.loads(raw)
     except Exception:
         return block("INVALID_SCHEMA")
 
     if not isinstance(payload, dict):
         return block("INVALID_SCHEMA")
 
-    # Required top-level fields
-    required = {
-        "provenance",
-        "humanApproved",
-        "action"
-    }
-
-    allowed_top_level = {
+    allowed_top = {
         "provenance",
         "humanApproved",
         "untrustedContent",
         "action"
     }
 
-    # Reject missing or extra fields
-    if not required.issubset(payload.keys()):
+    required_top = {
+        "provenance",
+        "humanApproved",
+        "action"
+    }
+
+    if not required_top.issubset(payload.keys()):
         return block("INVALID_SCHEMA")
 
-    if not set(payload.keys()).issubset(allowed_top_level):
+    if not set(payload.keys()).issubset(allowed_top):
         return block("INVALID_SCHEMA")
 
-    provenance = payload["provenance"]
-    human_approved = payload["humanApproved"]
-    action = payload["action"]
-
-    # provenance
-    if provenance not in {"trusted", "untrusted"}:
+    if not isinstance(payload["provenance"], str):
         return block("INVALID_SCHEMA")
 
-    # humanApproved
-    if not isinstance(human_approved, bool):
+    if payload["provenance"] not in {"trusted", "untrusted"}:
         return block("INVALID_SCHEMA")
 
-    # untrustedContent, if supplied
+    if not isinstance(payload["humanApproved"], bool):
+        return block("INVALID_SCHEMA")
+
     if "untrustedContent" in payload:
         if not isinstance(payload["untrustedContent"], str):
             return block("INVALID_SCHEMA")
 
-    # action
+    action = payload["action"]
+
     if not isinstance(action, dict):
         return block("INVALID_SCHEMA")
 
@@ -150,12 +145,10 @@ async def action_firewall(request: Request):
         if not exact_keys(args, {"query"}):
             return block("INVALID_SCHEMA")
 
-        query = args["query"]
-
-        if not isinstance(query, str):
+        if not isinstance(args["query"], str):
             return block("INVALID_SCHEMA")
 
-        if len(query) < 1 or len(query) > 200:
+        if not 1 <= len(args["query"]) <= 200:
             return block("INVALID_SCHEMA")
 
 
@@ -164,16 +157,13 @@ async def action_firewall(request: Request):
         if not exact_keys(args, {"tenantId", "recordId"}):
             return block("INVALID_SCHEMA")
 
-        tenant_id = args["tenantId"]
-        record_id = args["recordId"]
-
-        if not isinstance(tenant_id, str):
+        if not isinstance(args["tenantId"], str):
             return block("INVALID_SCHEMA")
 
-        if not isinstance(record_id, str):
+        if not isinstance(args["recordId"], str):
             return block("INVALID_SCHEMA")
 
-        if record_id == "":
+        if args["recordId"] == "":
             return block("INVALID_SCHEMA")
 
 
@@ -212,7 +202,7 @@ async def action_firewall(request: Request):
 
 
     # =====================================================
-    # 5. EMAIL EGRESS
+    # 5. EGRESS
     # =====================================================
 
     if tool == "send_email":
@@ -222,28 +212,22 @@ async def action_firewall(request: Request):
         if "@" not in email:
             return block("EGRESS_DENIED")
 
-        parts = email.rsplit("@", 1)
+        local, domain = email.rsplit("@", 1)
 
-        if len(parts) != 2:
+        if local == "" or domain == "":
             return block("EGRESS_DENIED")
 
-        local_part, domain = parts
-
-        if local_part == "":
-            return block("EGRESS_DENIED")
-
-        # EXACT domain match
         if domain != ALLOWED_EMAIL_DOMAIN:
             return block("EGRESS_DENIED")
 
 
     # =====================================================
-    # 6. HUMAN APPROVAL
+    # 6. APPROVAL
     # =====================================================
 
     if tool == "send_email":
 
-        if human_approved is not True:
+        if payload["humanApproved"] is not True:
             return block("APPROVAL_REQUIRED")
 
 
